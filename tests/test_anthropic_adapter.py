@@ -226,6 +226,21 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert resolve_anthropic_token() == "cc-auto-token"
 
+    def test_falls_back_to_hermes_oauth_credentials(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        hermes_oauth_file = tmp_path / ".hermes" / ".anthropic_oauth.json"
+        hermes_oauth_file.parent.mkdir(parents=True)
+        hermes_oauth_file.write_text(json.dumps({
+            "accessToken": "hermes-oauth-token",
+            "refreshToken": "refresh",
+            "expiresAt": int(time.time() * 1000) + 3600_000,
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._HERMES_OAUTH_FILE", hermes_oauth_file)
+        assert resolve_anthropic_token() == "hermes-oauth-token"
+
     def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
@@ -243,6 +258,22 @@ class TestResolveAnthropicToken:
 
         assert resolve_anthropic_token() == "cc-auto-token"
 
+    def test_prefers_refreshable_hermes_oauth_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        hermes_oauth_file = tmp_path / ".hermes" / ".anthropic_oauth.json"
+        hermes_oauth_file.parent.mkdir(parents=True)
+        hermes_oauth_file.write_text(json.dumps({
+            "accessToken": "hermes-fresh-token",
+            "refreshToken": "refresh-token",
+            "expiresAt": int(time.time() * 1000) + 3600_000,
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._HERMES_OAUTH_FILE", hermes_oauth_file)
+
+        assert resolve_anthropic_token() == "hermes-fresh-token"
+
     def test_keeps_static_anthropic_token_when_only_non_refreshable_claude_key_exists(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
@@ -252,6 +283,22 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         assert resolve_anthropic_token() == "sk-ant-oat01-static-token"
+
+    def test_reports_hermes_oauth_source(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        hermes_oauth_file = tmp_path / ".hermes" / ".anthropic_oauth.json"
+        hermes_oauth_file.parent.mkdir(parents=True)
+        hermes_oauth_file.write_text(json.dumps({
+            "accessToken": "hermes-source-token",
+            "refreshToken": "refresh-token",
+            "expiresAt": int(time.time() * 1000) + 3600_000,
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("agent.anthropic_adapter._HERMES_OAUTH_FILE", hermes_oauth_file)
+
+        assert get_anthropic_token_source("hermes-source-token") == "hermes_oauth_credentials_file"
 
 
 class TestRefreshOauthToken:
@@ -404,8 +451,8 @@ class TestRunOauthSetupToken:
         assert token == "from-cred-file"
         mock_run.assert_called_once()
 
-    def test_returns_token_from_env_var(self, monkeypatch, tmp_path):
-        """Falls back to CLAUDE_CODE_OAUTH_TOKEN env var when no cred files."""
+    def test_ignores_unchanged_preexisting_env_var(self, monkeypatch, tmp_path):
+        """Does not mistake a preexisting env var for a newly-created setup-token."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-env-var")
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
@@ -415,7 +462,7 @@ class TestRunOauthSetupToken:
             mock_run.return_value = MagicMock(returncode=0)
             token = run_oauth_setup_token()
 
-        assert token == "from-env-var"
+        assert token is None
 
     def test_returns_none_when_no_creds_found(self, monkeypatch, tmp_path):
         """Returns None when subprocess completes but no credentials are found."""

@@ -19,7 +19,8 @@ from tools.file_tools import (
     clear_read_tracker,
     reset_file_dedup,
     _is_blocked_device,
-    _MAX_READ_CHARS,
+    _get_max_read_chars,
+    _DEFAULT_MAX_READ_CHARS,
 )
 
 
@@ -100,9 +101,10 @@ class TestCharacterCountGuard(unittest.TestCase):
         clear_read_tracker()
 
     @patch("tools.file_tools._get_file_ops")
-    def test_oversized_read_rejected(self, mock_ops):
-        """A read that returns >_MAX_READ_CHARS is rejected."""
-        big_content = "x" * (_MAX_READ_CHARS + 1)
+    @patch("tools.file_tools._get_max_read_chars", return_value=_DEFAULT_MAX_READ_CHARS)
+    def test_oversized_read_rejected(self, _mock_limit, mock_ops):
+        """A read that returns >max chars is rejected."""
+        big_content = "x" * (_DEFAULT_MAX_READ_CHARS + 1)
         mock_ops.return_value = _make_fake_ops(
             content=big_content,
             total_lines=5000,
@@ -123,10 +125,12 @@ class TestCharacterCountGuard(unittest.TestCase):
         self.assertIn("content", result)
 
     @patch("tools.file_tools._get_file_ops")
-    def test_content_under_limit_passes(self, mock_ops):
+    @patch("tools.file_tools._get_max_read_chars", return_value=_DEFAULT_MAX_READ_CHARS)
+    def test_content_under_limit_passes(self, _mock_limit, mock_ops):
         """Content just under the limit should pass through fine."""
         mock_ops.return_value = _make_fake_ops(
-            content="y" * (_MAX_READ_CHARS - 1), file_size=_MAX_READ_CHARS - 1,
+            content="y" * (_DEFAULT_MAX_READ_CHARS - 1),
+            file_size=_DEFAULT_MAX_READ_CHARS - 1,
         )
         result = json.loads(read_file_tool("/tmp/justunder.txt", task_id="under"))
         self.assertNotIn("error", result)

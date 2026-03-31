@@ -21,8 +21,34 @@ _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 # 100K chars ≈ 25–35K tokens across typical tokenisers.  Files larger than
 # this in a single read are a context-window hazard — the model should use
 # offset+limit to read the relevant section.
+#
+# Configurable via config.yaml:  file_read_max_chars: 200000
 # ---------------------------------------------------------------------------
-_MAX_READ_CHARS = 100_000
+_DEFAULT_MAX_READ_CHARS = 100_000
+_max_read_chars_cached: int | None = None
+
+
+def _get_max_read_chars() -> int:
+    """Return the configured max characters per file read.
+
+    Reads ``file_read_max_chars`` from config.yaml on first call, caches
+    the result for the lifetime of the process.  Falls back to the
+    built-in default if the config is missing or invalid.
+    """
+    global _max_read_chars_cached
+    if _max_read_chars_cached is not None:
+        return _max_read_chars_cached
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        val = cfg.get("file_read_max_chars")
+        if isinstance(val, (int, float)) and val > 0:
+            _max_read_chars_cached = int(val)
+            return _max_read_chars_cached
+    except Exception:
+        pass
+    _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
+    return _max_read_chars_cached
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
@@ -325,12 +351,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # not the raw file size, because that's what actually enters context.
         content_len = len(result.content or "")
         file_size = result_dict.get("file_size", 0)
-        if content_len > _MAX_READ_CHARS:
+        max_chars = _get_max_read_chars()
+        if content_len > max_chars:
             total_lines = result_dict.get("total_lines", "unknown")
             return json.dumps({
                 "error": (
                     f"Read produced {content_len:,} characters which exceeds "
-                    f"the safety limit ({_MAX_READ_CHARS:,} chars). "
+                    f"the safety limit ({max_chars:,} chars). "
                     "Use offset and limit to read a smaller range. "
                     f"The file has {total_lines} lines total."
                 ),

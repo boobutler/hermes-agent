@@ -1611,6 +1611,11 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Bounded in-memory map from completion reply anchors to background
+        # task/session ids.  Ephemeral by design: replies to old completion
+        # messages after a gateway restart fall back to normal chat routing.
+        self._background_reply_continuations: "OrderedDict[tuple[str, str, str], Dict[str, Any]]" = OrderedDict()
+        self._background_reply_continuations_max = 256
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -6523,6 +6528,11 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        if not is_internal:
+            background_continuation = await self._background_reply_continuation_for_event(event)
+            if background_continuation is not None:
+                return background_continuation
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -11311,6 +11321,209 @@ class GatewayRunner:
             )
         return t("gateway.rollback.restore_failed", error=result["error"])
 
+    def _background_reply_continuation_key(
+        self,
+        source: "SessionSource",
+        message_id: Any,
+    ) -> Optional[tuple[str, str, str]]:
+        """Return the bounded-map key for a platform/chat/message reply anchor."""
+        if source is None or message_id is None:
+            return None
+        platform = _gateway_platform_value(getattr(source, "platform", None))
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        message_id_str = str(message_id or "")
+        if not platform or not chat_id or not message_id_str:
+            return None
+        return platform, chat_id, message_id_str
+
+    def _background_reply_continuation_store(self) -> "OrderedDict[tuple[str, str, str], Dict[str, Any]]":
+        """Return the in-memory background reply continuation store, creating it if needed."""
+        store = getattr(self, "_background_reply_continuations", None)
+        if not isinstance(store, OrderedDict):
+            store = OrderedDict()
+            self._background_reply_continuations = store
+        if not hasattr(self, "_background_reply_continuations_max"):
+            self._background_reply_continuations_max = 256
+        return store
+
+    @staticmethod
+    def _background_completion_message_ids(send_result: Any) -> List[str]:
+        """Extract every visible platform message id from a background completion send."""
+        ids: List[str] = []
+        seen: set[str] = set()
+
+        def add(raw_id: Any) -> None:
+            if raw_id is None:
+                return
+            message_id = str(raw_id or "")
+            if not message_id or message_id in seen:
+                return
+            seen.add(message_id)
+            ids.append(message_id)
+
+        add(getattr(send_result, "message_id", None))
+        for message_id in getattr(send_result, "continuation_message_ids", ()) or ():
+            add(message_id)
+
+        raw_response = getattr(send_result, "raw_response", None)
+        if isinstance(raw_response, dict):
+            raw_message_ids = raw_response.get("message_ids")
+            if isinstance(raw_message_ids, (list, tuple, set)):
+                for message_id in raw_message_ids:
+                    add(message_id)
+            else:
+                add(raw_message_ids)
+        return ids
+
+    def _remember_background_reply_continuation(
+        self,
+        *,
+        source: "SessionSource",
+        task_id: str,
+        send_result: Any,
+    ) -> None:
+        """Remember completion message ids so replies can continue the same bg session."""
+        if not getattr(send_result, "success", False):
+            return
+        message_ids = self._background_completion_message_ids(send_result)
+        if not message_ids:
+            return
+        store = self._background_reply_continuation_store()
+        try:
+            stored_source = dataclasses.replace(source)
+        except Exception:
+            stored_source = source
+        for message_id in message_ids:
+            key = self._background_reply_continuation_key(source, message_id)
+            if key is None:
+                continue
+            store[key] = {
+                "task_id": task_id,
+                "source": stored_source,
+                "thread_metadata": self._thread_metadata_for_source(source),
+                "created_at": time.time(),
+            }
+            store.move_to_end(key)
+        max_entries = int(getattr(self, "_background_reply_continuations_max", 256) or 256)
+        while len(store) > max_entries:
+            store.popitem(last=False)
+
+    @staticmethod
+    def _background_continuation_source(
+        stored_source: "SessionSource",
+        event_source: "SessionSource",
+        event: MessageEvent,
+    ) -> "SessionSource":
+        """Merge live user identity with stored delivery/thread source metadata."""
+        if stored_source is None:
+            return event_source
+        if event_source is None:
+            return stored_source
+        try:
+            return dataclasses.replace(
+                stored_source,
+                chat_id=getattr(event_source, "chat_id", None) or getattr(stored_source, "chat_id", None),
+                chat_name=getattr(event_source, "chat_name", None) or getattr(stored_source, "chat_name", None),
+                chat_type=getattr(event_source, "chat_type", None) or getattr(stored_source, "chat_type", None),
+                user_id=getattr(event_source, "user_id", None) or getattr(stored_source, "user_id", None),
+                user_name=getattr(event_source, "user_name", None) or getattr(stored_source, "user_name", None),
+                thread_id=getattr(event_source, "thread_id", None) or getattr(stored_source, "thread_id", None),
+                chat_topic=getattr(event_source, "chat_topic", None) or getattr(stored_source, "chat_topic", None),
+                user_id_alt=getattr(event_source, "user_id_alt", None) or getattr(stored_source, "user_id_alt", None),
+                chat_id_alt=getattr(event_source, "chat_id_alt", None) or getattr(stored_source, "chat_id_alt", None),
+                is_bot=bool(getattr(event_source, "is_bot", False) or getattr(stored_source, "is_bot", False)),
+                guild_id=getattr(event_source, "guild_id", None) or getattr(stored_source, "guild_id", None),
+                parent_chat_id=(
+                    getattr(event_source, "parent_chat_id", None)
+                    or getattr(stored_source, "parent_chat_id", None)
+                ),
+                message_id=(
+                    getattr(event, "message_id", None)
+                    or getattr(event_source, "message_id", None)
+                    or getattr(stored_source, "message_id", None)
+                ),
+            )
+        except Exception:
+            return event_source
+
+    @staticmethod
+    def _image_paths_from_media(
+        media_urls: Optional[List[str]],
+        media_types: Optional[List[str]],
+        *,
+        message_type: Optional[MessageType] = None,
+    ) -> List[str]:
+        """Return media paths that should be treated as user image attachments."""
+        image_paths: List[str] = []
+        if not media_urls:
+            return image_paths
+
+        media_types = media_types or []
+        is_photo_message = message_type == MessageType.PHOTO
+        for i, path in enumerate(media_urls):
+            if not path:
+                continue
+            raw_type = media_types[i] if i < len(media_types) else ""
+            mtype = str(raw_type or "").strip().lower()
+            if mtype.startswith("image/") or mtype == "image" or is_photo_message:
+                image_paths.append(path)
+        return image_paths
+
+    async def _background_reply_continuation_for_event(self, event: MessageEvent) -> Optional[str]:
+        """Route replies to known background completion messages back into that bg session."""
+        reply_to_message_id = getattr(event, "reply_to_message_id", None)
+        if reply_to_message_id is None:
+            return None
+        prompt = (getattr(event, "text", None) or "").strip()
+        if not prompt:
+            return None
+
+        source = event.source
+        key = self._background_reply_continuation_key(source, reply_to_message_id)
+        if key is None:
+            return None
+        store = self._background_reply_continuation_store()
+        entry = store.get(key)
+        if not entry:
+            return None
+        store.move_to_end(key)
+
+        task_id = entry.get("task_id")
+        if not task_id:
+            return None
+        continuation_source = self._background_continuation_source(
+            entry.get("source"),
+            source,
+            event,
+        )
+        event_message_id = self._reply_anchor_for_event(event)
+        media_urls = list(event.media_urls) if event.media_urls else []
+        media_types = list(event.media_types) if event.media_types else []
+
+        task = asyncio.create_task(
+            self._run_background_task(
+                prompt,
+                continuation_source,
+                task_id,
+                event_message_id=event_message_id,
+                media_urls=media_urls,
+                media_types=media_types,
+                message_type=event.message_type,
+            )
+        )
+        if not hasattr(self, "_background_tasks"):
+            self._background_tasks = set()
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        logger.info(
+            "Routing reply to background completion message %s into task %s",
+            reply_to_message_id,
+            task_id,
+        )
+        return t("gateway.background.started", preview=preview, task_id=task_id)
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -11340,6 +11553,7 @@ class GatewayRunner:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                message_type=event.message_type,
             )
         )
         self._background_tasks.add(_task)
@@ -11356,6 +11570,7 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        message_type: Optional[MessageType] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -11398,22 +11613,74 @@ class GatewayRunner:
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
-            # Enrich the prompt with image descriptions so the background
-            # agent can see user-attached images (same as the main flow).
-            enriched_prompt = prompt
-            if media_urls:
-                image_paths = []
-                for i, path in enumerate(media_urls):
-                    mtype = media_types[i] if i < len(media_types) else ""
-                    if mtype.startswith("image/"):
-                        image_paths.append(path)
-                if image_paths:
+            # Mirror normal inbound image routing for background tasks:
+            # native vision-capable models receive multimodal content parts;
+            # other models receive text-mode vision enrichment.
+            agent_user_message: Any = prompt
+            image_paths = self._image_paths_from_media(
+                media_urls,
+                media_types,
+                message_type=message_type,
+            )
+            if image_paths:
+                image_mode = self._decide_image_input_mode()
+                if image_mode == "native":
+                    native_attached = False
                     try:
-                        enriched_prompt = await self._enrich_message_with_vision(
-                            prompt, image_paths,
+                        from agent.image_routing import build_native_content_parts
+
+                        parts, skipped = build_native_content_parts(prompt, image_paths)
+                        if skipped:
+                            logger.warning(
+                                "Background native image attachment: skipped %d unreadable path(s): %s",
+                                len(skipped),
+                                skipped,
+                            )
+                        if any(part.get("type") == "image_url" for part in parts):
+                            agent_user_message = parts
+                            native_attached = True
+                        else:
+                            logger.warning(
+                                "Background native image attachment skipped all image paths; falling back to text vision"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Background native image attachment failed; falling back to text vision: %s",
+                            e,
+                        )
+
+                    if not native_attached:
+                        try:
+                            agent_user_message = await self._enrich_message_with_vision(
+                                prompt,
+                                image_paths,
+                            )
+                        except Exception as e:
+                            logger.warning("Background task vision enrichment failed: %s", e)
+                else:
+                    try:
+                        agent_user_message = await self._enrich_message_with_vision(
+                            prompt,
+                            image_paths,
                         )
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
+
+            background_conversation_history: Optional[List[Dict[str, Any]]] = None
+            if self._session_db:
+                try:
+                    stored_history = self._session_db.get_messages_as_conversation(
+                        task_id,
+                        include_ancestors=True,
+                    )
+                    if stored_history:
+                        background_conversation_history = stored_history
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load background task history for %s: %s",
+                        task_id,
+                        e,
+                    )
 
             def run_sync():
                 agent = AIAgent(
@@ -11445,10 +11712,13 @@ class GatewayRunner:
                     fallback_model=self._fallback_model,
                 )
                 try:
-                    return agent.run_conversation(
-                        user_message=enriched_prompt,
-                        task_id=task_id,
-                    )
+                    run_kwargs = {
+                        "user_message": agent_user_message,
+                        "task_id": task_id,
+                    }
+                    if background_conversation_history:
+                        run_kwargs["conversation_history"] = background_conversation_history
+                    return agent.run_conversation(**run_kwargs)
                 finally:
                     self._cleanup_agent_resources(agent)
 
@@ -11467,26 +11737,41 @@ class GatewayRunner:
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
+                    send_result = await adapter.send(
                         chat_id=source.chat_id,
                         content=header + text_content,
                         metadata=_thread_metadata,
                     )
+                    self._remember_background_reply_continuation(
+                        source=source,
+                        task_id=task_id,
+                        send_result=send_result,
+                    )
                 elif not images and not media_files:
-                    await adapter.send(
+                    send_result = await adapter.send(
                         chat_id=source.chat_id,
                         content=header + "(No response generated)",
                         metadata=_thread_metadata,
+                    )
+                    self._remember_background_reply_continuation(
+                        source=source,
+                        task_id=task_id,
+                        send_result=send_result,
                     )
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
                     try:
-                        await adapter.send_image(
+                        send_result = await adapter.send_image(
                             chat_id=source.chat_id,
                             image_url=image_url,
                             caption=alt_text,
                             metadata=_thread_metadata,
+                        )
+                        self._remember_background_reply_continuation(
+                            source=source,
+                            task_id=task_id,
+                            send_result=send_result,
                         )
                     except Exception:
                         pass
@@ -11494,19 +11779,29 @@ class GatewayRunner:
                 # Send media files
                 for media_path, _is_voice in (media_files or []):
                     try:
-                        await adapter.send_document(
+                        send_result = await adapter.send_document(
                             chat_id=source.chat_id,
                             file_path=media_path,
                             metadata=_thread_metadata,
+                        )
+                        self._remember_background_reply_continuation(
+                            source=source,
+                            task_id=task_id,
+                            send_result=send_result,
                         )
                     except Exception:
                         pass
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
+                send_result = await adapter.send(
                     chat_id=source.chat_id,
                     content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
                     metadata=_thread_metadata,
+                )
+                self._remember_background_reply_continuation(
+                    source=source,
+                    task_id=task_id,
+                    send_result=send_result,
                 )
 
         except Exception as e:

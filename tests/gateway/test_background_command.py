@@ -6,12 +6,13 @@ background session) across gateway messenger platforms.
 
 import asyncio
 import os
+from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
 
 
@@ -38,7 +39,10 @@ def _make_runner():
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._busy_ack_ts = {}
     runner._background_tasks = set()
+    runner._background_reply_continuations = OrderedDict()
 
     mock_store = MagicMock()
     runner.session_store = mock_store
@@ -47,6 +51,37 @@ def _make_runner():
     runner.hooks = HookRegistry()
 
     return runner
+
+
+def _configure_background_agent_runtime(runner, monkeypatch, *, final_response="done"):
+    """Configure a bare runner so _run_background_task executes inline."""
+    from gateway import run as gateway_run
+
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=("test-model", {"api_key": "test-key"})
+    )
+    runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+    runner._load_service_tier = MagicMock(return_value=None)
+    runner._resolve_turn_agent_config = MagicMock(
+        return_value={
+            "model": "test-model",
+            "runtime": {"api_key": "test-key"},
+            "request_overrides": None,
+        }
+    )
+
+    async def run_inline(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = AsyncMock(side_effect=run_inline)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+    mock_adapter = AsyncMock()
+    mock_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
+    mock_adapter.extract_media = MagicMock(return_value=([], final_response))
+    mock_adapter.extract_images = MagicMock(return_value=([], final_response))
+    runner.adapters[Platform.TELEGRAM] = mock_adapter
+    return mock_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +174,42 @@ class TestHandleBackgroundCommand:
         assert "Background task started" in result
         runner._run_background_task.assert_called_once()
         assert runner._run_background_task.call_args.kwargs["event_message_id"] == "463"
+
+    @pytest.mark.asyncio
+    async def test_passes_attached_media_to_background_task(self):
+        """Background commands preserve attached image metadata for the spawned task."""
+        runner = _make_runner()
+        runner._run_background_task = AsyncMock()
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            return MagicMock()
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+        )
+        event = MessageEvent(
+            text="/bg describe this",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="463",
+            media_urls=["/tmp/a.png"],
+            media_types=["image/png"],
+        )
+
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            result = await runner._handle_background_command(event)
+
+        assert "Background task started" in result
+        runner._run_background_task.assert_called_once()
+        kwargs = runner._run_background_task.call_args.kwargs
+        assert kwargs["event_message_id"] == "463"
+        assert kwargs["media_urls"] == ["/tmp/a.png"]
+        assert kwargs["media_types"] == ["image/png"]
+        assert kwargs["message_type"] == MessageType.PHOTO
 
     @pytest.mark.asyncio
     async def test_prompt_truncated_in_preview(self):
@@ -269,6 +340,204 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_continuation_loads_existing_background_history(self, monkeypatch):
+        """Replies routed into a background task should continue that task's DB history."""
+        runner = _make_runner()
+        _configure_background_agent_runtime(runner, monkeypatch)
+        history = [
+            {"role": "user", "content": "first prompt"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        runner._session_db = MagicMock()
+        runner._session_db.get_messages_as_conversation.return_value = history
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {"final_response": "done", "messages": []}
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("continue", source, "bg_test")
+
+        runner._session_db.get_messages_as_conversation.assert_called_once_with(
+            "bg_test",
+            include_ancestors=True,
+        )
+        mock_agent_instance.run_conversation.assert_called_once_with(
+            user_message="continue",
+            task_id="bg_test",
+            conversation_history=history,
+        )
+
+    @pytest.mark.asyncio
+    async def test_text_mode_enriches_image_prompt(self, monkeypatch):
+        """Text-mode background image handling pre-analyzes image attachments only."""
+        runner = _make_runner()
+        _configure_background_agent_runtime(runner, monkeypatch)
+        runner._decide_image_input_mode = MagicMock(return_value="text")
+        runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED PROMPT")
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {"final_response": "done", "messages": []}
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task(
+                "describe it",
+                source,
+                "bg_test",
+                media_urls=["/tmp/a.png", "/tmp/audio.ogg", "/tmp/loose-image"],
+                media_types=["image/png", "audio/ogg", "image"],
+            )
+
+        runner._enrich_message_with_vision.assert_awaited_once_with(
+            "describe it",
+            ["/tmp/a.png", "/tmp/loose-image"],
+        )
+        mock_agent_instance.run_conversation.assert_called_once_with(
+            user_message="ENRICHED PROMPT",
+            task_id="bg_test",
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_mode_attaches_image_content_parts(self, monkeypatch, tmp_path):
+        """Native-mode background image handling passes multimodal content parts."""
+        runner = _make_runner()
+        _configure_background_agent_runtime(runner, monkeypatch)
+        runner._decide_image_input_mode = MagicMock(return_value="native")
+        runner._enrich_message_with_vision = AsyncMock()
+
+        image_path = tmp_path / "one.png"
+        image_path.write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+            b"\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01"
+            b"\xf6\x178U\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {"final_response": "done", "messages": []}
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task(
+                "what is in this image?",
+                source,
+                "bg_test",
+                media_urls=[str(image_path)],
+                media_types=["image/png"],
+            )
+
+        runner._enrich_message_with_vision.assert_not_called()
+        user_message = mock_agent_instance.run_conversation.call_args.kwargs["user_message"]
+        assert isinstance(user_message, list)
+        assert user_message[0]["type"] == "text"
+        assert "what is in this image?" in user_message[0]["text"]
+        assert any(part.get("type") == "image_url" for part in user_message)
+
+    @pytest.mark.asyncio
+    async def test_photo_message_with_missing_media_type_is_image(self, monkeypatch):
+        """Photo messages without MIME metadata still route attached files as images."""
+        runner = _make_runner()
+        _configure_background_agent_runtime(runner, monkeypatch)
+        runner._decide_image_input_mode = MagicMock(return_value="text")
+        runner._enrich_message_with_vision = AsyncMock(return_value="PHOTO ENRICHED")
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {"final_response": "done", "messages": []}
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task(
+                "caption",
+                source,
+                "bg_test",
+                media_urls=["/tmp/photo.jpg"],
+                media_types=[],
+                message_type=MessageType.PHOTO,
+            )
+
+        runner._enrich_message_with_vision.assert_awaited_once_with(
+            "caption",
+            ["/tmp/photo.jpg"],
+        )
+        mock_agent_instance.run_conversation.assert_called_once_with(
+            user_message="PHOTO ENRICHED",
+            task_id="bg_test",
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_image_attachments_are_not_sent_to_vision(self, monkeypatch):
+        """Background audio/doc attachments should not be treated as images."""
+        runner = _make_runner()
+        _configure_background_agent_runtime(runner, monkeypatch)
+        runner._decide_image_input_mode = MagicMock(return_value="text")
+        runner._enrich_message_with_vision = AsyncMock()
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {"final_response": "done", "messages": []}
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task(
+                "summarize attachments",
+                source,
+                "bg_test",
+                media_urls=["/tmp/audio.ogg", "/tmp/doc.pdf"],
+                media_types=["audio/ogg", "application/pdf"],
+                message_type=MessageType.DOCUMENT,
+            )
+
+        runner._enrich_message_with_vision.assert_not_called()
+        mock_agent_instance.run_conversation.assert_called_once_with(
+            user_message="summarize attachments",
+            task_id="bg_test",
+        )
+
+    @pytest.mark.asyncio
     async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(self, monkeypatch):
         """Background completion metadata must let Telegram send thread id plus reply id."""
         from gateway import run as gateway_run
@@ -321,6 +590,86 @@ class TestRunBackgroundTask:
         }
 
     @pytest.mark.asyncio
+    async def test_successful_task_records_all_completion_message_ids_for_replies(self, monkeypatch):
+        """Every visible completion message chunk should become a reply continuation anchor."""
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "done", "messages": []}
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="999",
+                continuation_message_ids=("1000",),
+                raw_response={"message_ids": ["1001"]},
+            )
+        )
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="20197",
+        )
+
+        await runner._run_background_task(
+            "say hello",
+            source,
+            "bg_test",
+            event_message_id="463",
+        )
+
+        for message_id in ("999", "1000", "1001"):
+            entry = runner._background_reply_continuations[("telegram", "67890", message_id)]
+            assert entry["task_id"] == "bg_test"
+            assert entry["source"].thread_id == "20197"
+
+    def test_completion_reply_anchor_map_is_bounded(self):
+        """The in-memory reply continuation map should evict oldest anchors."""
+        runner = _make_runner()
+        runner._background_reply_continuations_max = 2
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="20197",
+        )
+
+        for message_id in ("1", "2", "3"):
+            runner._remember_background_reply_continuation(
+                source=source,
+                task_id="bg_test",
+                send_result=SendResult(success=True, message_id=message_id),
+            )
+
+        assert list(runner._background_reply_continuations) == [
+            ("telegram", "67890", "2"),
+            ("telegram", "67890", "3"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_agent_cleanup_runs_when_background_agent_raises(self):
         """Temporary background agents must be cleaned up on error paths too."""
         runner = _make_runner()
@@ -371,6 +720,98 @@ class TestRunBackgroundTask:
         call_args = mock_adapter.send.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "failed" in content.lower()
+
+
+class TestBackgroundReplyContinuation:
+    """Tests for replies to background completion messages."""
+
+    @pytest.mark.asyncio
+    async def test_reply_to_known_completion_routes_to_same_background_session(self):
+        """Known completion replies should start the same bg session before normal dispatch."""
+        runner = _make_runner()
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner._session_key_for_source = MagicMock(side_effect=AssertionError("normal session dispatch should not run"))
+        runner._run_background_task = AsyncMock()
+
+        stored_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="20197",
+        )
+        event_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+        )
+        runner._background_reply_continuations[("telegram", "67890", "999")] = {
+            "task_id": "bg_seeded",
+            "source": stored_source,
+        }
+        event = MessageEvent(
+            text="continue this",
+            source=event_source,
+            message_id="1002",
+            reply_to_message_id="999",
+            message_type=MessageType.PHOTO,
+            media_urls=["/tmp/reply-image.png"],
+            media_types=["image/png"],
+        )
+
+        with patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
+            result = await runner._handle_message(event)
+
+        assert "Background task started" in result
+        assert "bg_seeded" in result
+        runner._run_background_task.assert_called_once()
+        assert runner._run_background_task.call_args.args[2] == "bg_seeded"
+        assert runner._run_background_task.call_args.args[1].thread_id == "20197"
+        assert runner._run_background_task.call_args.kwargs["event_message_id"] == "1002"
+        assert runner._run_background_task.call_args.kwargs["media_urls"] == ["/tmp/reply-image.png"]
+        assert runner._run_background_task.call_args.kwargs["media_types"] == ["image/png"]
+        assert runner._run_background_task.call_args.kwargs["message_type"] is MessageType.PHOTO
+        runner._session_key_for_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_unknown_completion_falls_through_to_normal_dispatch(self):
+        """Replies that do not match the bounded bg map keep normal chat routing."""
+        runner = _make_runner()
+        runner.config = {}
+        runner._draining = False
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner._session_key_for_source = MagicMock(return_value="telegram:67890:12345")
+        runner._is_telegram_topic_root_lobby = MagicMock(return_value=False)
+        runner._begin_session_run_generation = MagicMock(return_value=7)
+        runner._handle_message_with_agent = AsyncMock(return_value="normal dispatch")
+        runner._post_turn_goal_continuation = AsyncMock()
+        runner._release_running_agent_state = MagicMock()
+        runner._run_background_task = AsyncMock()
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="20197",
+        )
+        runner._background_reply_continuations[("telegram", "67890", "999")] = {
+            "task_id": "bg_seeded",
+            "source": source,
+        }
+        event = MessageEvent(
+            text="regular reply",
+            source=source,
+            message_id="1002",
+            reply_to_message_id="404",
+        )
+
+        result = await runner._handle_message(event)
+
+        assert result == "normal dispatch"
+        runner._run_background_task.assert_not_called()
+        runner._handle_message_with_agent.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
